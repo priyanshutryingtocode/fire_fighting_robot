@@ -22,9 +22,9 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(d.action, Action.STOP)
         self.assertEqual(d.state, RobotState.SAFE_STOP)
 
-    def test_clear_path_searches(self):
+    def test_clear_path_scans_for_fire(self):
         d = self.nav.update(self.no_fire, SensorData(100, 100), start=True)
-        self.assertEqual(d.action, Action.FORWARD)
+        self.assertEqual(d.action, Action.SCAN_360)
 
     def test_obstacle_and_clear_rear_reverses(self):
         d = self.nav.update(self.no_fire, SensorData(10, 100), start=True)

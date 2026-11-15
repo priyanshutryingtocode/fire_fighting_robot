@@ -6,9 +6,10 @@ from typing import Optional
 
 class RobotState(Enum):
     IDLE = auto()
-    SEARCH = auto()
+    SCAN_FIRE = auto()
     AVOID_OBSTACLE = auto()
     ALIGN_FIRE = auto()
+    APPROACH_FIRE = auto()
     SAFE_STOP = auto()
 
 
@@ -18,6 +19,7 @@ class Action(Enum):
     REVERSE = "REVERSE"
     TURN_LEFT = "TURN_LEFT"
     TURN_RIGHT = "TURN_RIGHT"
+    SCAN_360 = "SCAN_360"
 
 
 @dataclass
@@ -71,7 +73,8 @@ class Navigator:
                 self.state, Action.STOP, "Obstacle ahead; reverse clearance unknown/low"
             )
 
-        # Only a confirmed FIRE class result should drive fire alignment.
+        # A positive but not yet confirmed detection does not interrupt the
+        # scan. Only a confirmed FIRE result drives alignment or approach.
         strongest = fire_result.get("strongest")
         is_fire = (
             fire_result.get("confirmed", False)
@@ -80,14 +83,24 @@ class Navigator:
         )
         if is_fire:
             direction = fire_result.get("fire_direction", "NONE")
-            self.state = RobotState.ALIGN_FIRE
+            if direction in ("LEFT", "RIGHT"):
+                self.state = RobotState.ALIGN_FIRE
+            elif direction == "CENTER":
+                self.state = RobotState.APPROACH_FIRE
+                return NavigationDecision(
+                    self.state, Action.FORWARD, "Fire centered; approaching"
+                )
+            else:
+                self.state = RobotState.ALIGN_FIRE
+                return NavigationDecision(
+                    self.state, Action.STOP, "Fire direction uncertain"
+                )
             if direction == "LEFT":
                 return NavigationDecision(self.state, Action.TURN_LEFT, "Confirmed fire left")
             if direction == "RIGHT":
                 return NavigationDecision(self.state, Action.TURN_RIGHT, "Confirmed fire right")
-            if direction == "CENTER":
-                return NavigationDecision(self.state, Action.STOP, "Fire centered; hold position")
-            return NavigationDecision(self.state, Action.STOP, "Fire direction uncertain")
 
-        self.state = RobotState.SEARCH
-        return NavigationDecision(self.state, Action.FORWARD, "Searching for fire")
+        self.state = RobotState.SCAN_FIRE
+        return NavigationDecision(
+            self.state, Action.SCAN_360, "No confirmed fire; scanning in place"
+        )

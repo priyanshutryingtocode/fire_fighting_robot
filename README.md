@@ -38,8 +38,9 @@ The current navigation policy is intentionally conservative:
 - Missing front range -> SAFE_STOP.
 - Front obstacle -> reverse only if rear clearance is known and sufficient;
   otherwise STOP.
-- Confirmed fire -> request left/right alignment, or STOP if centered.
-- No confirmed fire -> request forward search, subject to Arduino safety checks.
+- Confirmed fire left/right -> request alignment; when centered, request
+  forward approach.
+- No confirmed fire -> request an in-place 360-degree scan.
 
 **Important limitation:** two front/rear sensors do not measure left/right
 clearance. This prototype does not autonomously choose a turn direction for
@@ -88,14 +89,19 @@ Run the original fire-detection camera demo:
 python main.py
 ```
 
-Run the new robot application in simulation mode:
+Run the camera fire-action simulation (assumes clear sensor readings):
 ```bash
-python robot_main.py --simulate
+python camera_fire_actions.py --camera 0
 ```
 
-Simulation mode deliberately has no valid ultrasonic readings, so it should
-remain stopped. It is for verifying camera/detector/UI integration, not
-simulating a complete physical environment.
+Run the scripted navigation scenario:
+```bash
+python fire_simulation.py
+```
+
+`camera_fire_actions.py` displays detections and proposed actions; it does not
+connect to the Arduino or move the robot. `robot_main.py --simulate` still has
+no ultrasonic readings and therefore safely remains stopped.
 
 ## Arduino setup and serial protocol
 
@@ -120,6 +126,10 @@ REVERSE
 TURN_LEFT
 TURN_RIGHT
 ```
+
+`SCAN_360` is currently a laptop-side decision used for simulation; the example
+Arduino sketch does not implement it. The sketch also deliberately disables
+turn commands, so update and calibrate the firmware before physical use.
 
 Every command is newline terminated. The sketch stops the motors if no valid
 command arrives before its watchdog expires. It also blocks forward movement
