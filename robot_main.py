@@ -11,7 +11,7 @@ from config import SERIAL_PORT, BAUD_RATE, SERIAL_TIMEOUT, FRONT_STOP_CM, REAR_C
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera", type=int, default=1)
     parser.add_argument("--model", default="models/fire_weights.pt")
     parser.add_argument("--port", default=SERIAL_PORT)
     parser.add_argument("--simulate", action="store_true",

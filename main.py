@@ -65,7 +65,7 @@ def parse_arguments():
     parser.add_argument(
         "--camera",
         type=int,
-        default=0,
+        default=1,
         help="Webcam device index (default: 0). Use 1 or 2 for external USB cameras.",
     )
     parser.add_argument(

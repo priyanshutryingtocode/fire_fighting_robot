@@ -1,4 +1,8 @@
-opencv-python
-ultralytics
-torch
-pyserial
+# Core computer vision
+ultralytics>=8.0.0
+opencv-python>=4.7.0
+numpy>=1.23.0
+
+# PyTorch with NVIDIA CUDA support
+torch==2.5.1
+torchvision==0.20.1
