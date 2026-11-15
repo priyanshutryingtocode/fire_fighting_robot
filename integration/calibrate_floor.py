@@ -1,5 +1,5 @@
 """
-One-time floor calibration for the camera planner.
+Calibrate the camera's image-to-floor mapping for distance estimates.
 
 Setup:
   1. Fix the webcam on the robot (tilted down so it sees ~1.5-2 m of floor).
@@ -16,7 +16,7 @@ Setup:
              [ robot ]
 
 Run:
-  python calibrate_floor.py --cam 0 --near 30 --size 40
+  python integration/calibrate_floor.py --cam 0 --near 30 --size 40
 
 Keys:
   p      freeze / unfreeze frame (freeze first, then click)
@@ -28,11 +28,13 @@ Keys:
 
 import argparse
 import json
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 ORDER = ["near-left", "near-right", "far-right", "far-left"]
+INTEGRATION_DIR = Path(__file__).resolve().parent
 
 
 def main():
@@ -41,7 +43,7 @@ def main():
     ap.add_argument("--image", help="use a saved photo instead of the camera")
     ap.add_argument("--near", type=float, default=30, help="cm from bumper to near tape edge")
     ap.add_argument("--size", type=float, default=40, help="square side length cm")
-    ap.add_argument("--out", default="floor_calib.json")
+    ap.add_argument("--out", default=str(INTEGRATION_DIR / "floor_calib.json"))
     args = ap.parse_args()
 
     cap = None

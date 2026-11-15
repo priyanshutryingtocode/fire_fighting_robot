@@ -8,7 +8,7 @@
  *
  *  WHO DOES WHAT
  *    Laptop (fire_vision.py) : webcam + YOLO -> fire direction + DISTANCE (cm)
- *                              + optional A* path heading. Sends over serial.
+ *                              + optional calibrated camera distance. Sends over serial.
  *    Arduino (this file)     : drives motors, avoids obstacles with ultrasonics,
  *                              stops near the fire, and switches the relay ON
  *                              only when the FLAME SENSOR detects the flame.
@@ -19,27 +19,26 @@
  *                               err  : -100 (far left) .. 0 (centre) .. +100 (far right)
  *                               dist : estimated distance to fire in cm (999 = unknown)
  *                               conf : YOLO confidence 0..100
- *      P,<heading>,<speed>    path planner says: steer <heading> deg (+ = right)
- *                             at <speed> % (only if floor calibration is used)
  *      N                      no fire in this frame
  *      X / G                  emergency stop / go again
  *    Arduino -> Laptop (every 200 ms)
- *      S,<state>,<dF>,<dL>,<dR>,<flame 0/1>,<vision P/F/N/->,<dist>,<pump 0/1>
+ *      S,<state>,<dF>,<dL>,<dR>,<flame 0/1>,<vision F/N/->,<dist>,<pump 0/1>
  *
  *  MISSION (state machine)
  *    SEARCH     spin in small steps until the camera sees fire
- *    TRACK      drive toward fire (planner heading or camera direction),
+ *    TRACK      drive toward fire using camera direction,
  *               slow down as distance drops, avoid obstacles with ultrasonics
  *    AVOID      back up, turn to the freer side, drive past, resume TRACK
  *    APPROACH   fire is close (camera dist <= STOP_DIST_CM): centre on it and
  *               creep forward until the flame sensor fires
- *    EXTINGUISH flame sensor ON -> relay ON -> pump sprays (servo sweeps)
+ *    AIM        stop, point nozzle/arm toward the fire, then settle
+ *    EXTINGUISH relay ON -> pump sprays (servo sweeps)
  *               until flame sensor OFF for 1 s (or 6 s max burst)
  *    VERIFY     pump off, wait, check again -> spray again or search for next fire
  *    ESTOP      everything off until 'G'
  *
- *  If the laptop is not connected, the robot still works in a basic way:
- *  it spins, and if the flame sensor ever detects fire it stops and sprays.
+ *  If the laptop is not connected, SEARCH still rotates. A flame sensor event
+ *  stops the motors; spraying also requires USE_SERVO and its aim interlock.
  * ============================================================================
  */
 
@@ -47,7 +46,7 @@
 //  1. BUILD OPTIONS
 // ----------------------------------------------------------------------------
 #define CALIBRATION_MODE 0   // 1 = print sensor values only, motors + pump OFF
-#define USE_SERVO        0   // 1 if a servo moves the nozzle (pin 9)
+#define USE_SERVO        0   // 1 only after an arm/nozzle servo is wired and calibrated (pin 9)
 #define USE_ULTRASONIC   0   // 1 when the 3 ultrasonic sensors are connected
 #define USE_OLED         1   // SH1106 128x64 I2C OLED on A4 (SDA) / A5 (SCL), needs U8g2 library
 #define LINK_BLUETOOTH   0   // 1 = laptop talks via HC-05 on A1/A2 instead of USB
@@ -123,7 +122,6 @@ const int STOP_DIST_CM   = 40;   // closer than this: stop driving, go to APPROA
 const int SPRAY_MAX_CM   = 70;   // flame sensor only allowed to trigger pump if fire this close
 // ultrasonics (cm)
 const int OBSTACLE_CM    = 25;   // obstacle in front (reactive mode)
-const int PLAN_VETO_CM   = 15;   // obstacle in front when A* planner is steering
 const int CLEAR_CM       = 45;
 const int SIDE_MIN_CM    = 12;
 const int CREEP_MIN_CM   = 12;   // never creep closer than this to anything
@@ -138,7 +136,6 @@ const int SPEED_TURN  = 60;
 const int SPEED_ALIGN = 45;
 const int MOTOR_MIN_PWM = 110;   // raise if motors hum but don't move (L293D loses ~2 V)
 const float STEER_KP  = 0.55;
-const int PLAN_FULL_TURN_DEG = 45;
 
 const uint8_t SERVO_CENTER = 90, SERVO_RANGE = 35, SWEEP_DEG = 15;
 const uint16_t SWEEP_PERIOD_MS = 1200;
@@ -150,29 +147,24 @@ const unsigned long VERIFY_MS         = 1500;
 const uint8_t       MAX_BURSTS        = 6;
 const unsigned long PUMP_TOTAL_MAX_MS = 60000; // tank-empty guard
 const unsigned long CREEP_MAX_MS      = 5000;  // APPROACH give-up time
+const unsigned long ARM_AIM_MS        = 700;   // allow arm/nozzle to reach target before pumping
 const unsigned long VISION_TIMEOUT_MS = 800;   // YOLO at 640px on CPU can be ~5 fps
 const unsigned long VISION_MEMORY_MS  = 1500;
-const unsigned long PLAN_TIMEOUT_MS   = 400;
 const unsigned long LOST_MS           = 2500;
-const unsigned long SEARCH_TURN_MS    = 250;
+const unsigned long SEARCH_REVOLUTION_MS = 4000; // calibrate: measured time for one full in-place turn
 const unsigned long SEARCH_PAUSE_MS   = 450;
 
 // ----------------------------------------------------------------------------
 //  TYPES & GLOBALS
 // ----------------------------------------------------------------------------
-enum State : uint8_t { SEARCH, TRACK, AVOID, APPROACH, EXTINGUISH, VERIFY, ESTOP, MANUAL };
-const char* const STATE_NAME[] = {"SEARCH", "TRACK", "AVOID", "APPROACH", "EXTINGUISH", "VERIFY", "ESTOP", "MANUAL"};
+enum State : uint8_t { SEARCH, TRACK, AVOID, APPROACH, AIM, EXTINGUISH, VERIFY, ESTOP, MANUAL };
+const char* const STATE_NAME[] = {"SEARCH", "TRACK", "AVOID", "APPROACH", "AIM", "EXTINGUISH", "VERIFY", "ESTOP", "MANUAL"};
 
 struct Vision {
   bool fire = false;
   int err = 0, dist = 999, conf = 0;
   unsigned long lastPacketMs = 0, lastFireMs = 0;
 } vis;
-
-struct Plan {
-  int heading = 0, speed = 0;
-  unsigned long lastMs = 0;
-} plan;
 
 struct Sensors {
   int dF = 400, dL = 400, dR = 400;
@@ -198,7 +190,6 @@ unsigned long avoidPhaseMs = 0;
 
 bool visionOnline();
 bool fireNow();
-bool planFresh();
 
 // ----------------------------------------------------------------------------
 //  ACTUATORS
@@ -325,7 +316,7 @@ void updateFlame() {
 // ----------------------------------------------------------------------------
 void handleLine(char* s) {
   unsigned long now = millis();
-  if (s[0] == 'F' || s[0] == 'N' || s[0] == 'P') vis.lastPacketMs = now;   // camera alive
+  if (s[0] == 'F' || s[0] == 'N') vis.lastPacketMs = now;   // camera alive
   int a, b, c;
   switch (s[0]) {
     case 'F':
@@ -337,23 +328,16 @@ void handleLine(char* s) {
         if (vis.conf >= VIS_MIN_CONF) vis.lastFireMs = now;
       }
       break;
-    case 'P':
-      if (sscanf(s + 1, ",%d,%d", &a, &b) == 2) {
-        plan.heading = constrain(a, -90, 90);
-        plan.speed   = constrain(b, 0, 100);
-        plan.lastMs  = now;
-      }
-      break;
     case 'N': vis.fire = false; break;
     case 'X': estopRequested = true;  break;
     case 'G': estopRequested = false; break;
-    // MANUAL driving from Serial Monitor (set line ending to "Newline")
-    case 'w': manualL =  MANUAL_SPEED; manualR =  MANUAL_SPEED; enter(MANUAL); break;
-    case 's': manualL = -MANUAL_SPEED; manualR = -MANUAL_SPEED; enter(MANUAL); break;
-    case 'a': manualL = -MANUAL_SPEED; manualR =  MANUAL_SPEED; enter(MANUAL); break;
-    case 'd': manualL =  MANUAL_SPEED; manualR = -MANUAL_SPEED; enter(MANUAL); break;
+    // One command per line in Serial Monitor; movement is case-insensitive.
+    case 'w': case 'W': manualL =  MANUAL_SPEED; manualR =  MANUAL_SPEED; enter(MANUAL); break;
+    case 's': case 'S': manualL = -MANUAL_SPEED; manualR = -MANUAL_SPEED; enter(MANUAL); break;
+    case 'a': case 'A': manualL = -MANUAL_SPEED; manualR =  MANUAL_SPEED; enter(MANUAL); break;
+    case 'd': case 'D': manualL =  MANUAL_SPEED; manualR = -MANUAL_SPEED; enter(MANUAL); break;
     case 'x': manualL = 0;             manualR = 0;             enter(MANUAL); break;
-    case 'A': enter(SEARCH); break;                                  // back to AUTO
+    case 'r': case 'R': enter(SEARCH); break;                        // back to AUTO
   }
 }
 
@@ -378,7 +362,7 @@ void sendTelemetry() {
   LINK.print(',');      LINK.print(sen.dL);
   LINK.print(',');      LINK.print(sen.dR);
   LINK.print(',');      LINK.print(sen.flame ? 1 : 0);
-  LINK.print(',');      LINK.print(!visionOnline() ? '-' : planFresh() ? 'P' : fireNow() ? 'F' : 'N');
+  LINK.print(',');      LINK.print(!visionOnline() ? '-' : fireNow() ? 'F' : 'N');
   LINK.print(',');      LINK.print(vis.dist);
   LINK.print(',');      LINK.println(pumpOn ? 1 : 0);
 }
@@ -389,13 +373,11 @@ void sendTelemetry() {
 bool visionOnline() { return vis.lastPacketMs && millis() - vis.lastPacketMs < VISION_TIMEOUT_MS; }
 bool fireNow()      { return visionOnline() && vis.fire && vis.conf >= VIS_MIN_CONF; }
 bool fireRecent()   { return vis.lastFireMs && millis() - vis.lastFireMs < VISION_MEMORY_MS; }
-bool planFresh()    { return plan.lastMs && millis() - plan.lastMs < PLAN_TIMEOUT_MS && fireNow(); }
 bool distKnown()    { return vis.dist < 999; }
 
-// Relay may switch ON only when the FLAME SENSOR detects flame AND the fire is
-// confirmed close. With camera: camera saw fire recently and (camera dist or
-// centre sonar) says it is within SPRAY_MAX_CM. Without camera (laptop off):
-// flame sensor alone decides.
+// Request the AIM stage only when the flame sensor detects flame. With camera,
+// also require recent fire evidence and near range (camera or centre sonar).
+// The AIM stage separately requires USE_SERVO before it can enable the pump.
 bool sprayAllowed() {
   if (!sen.flame) return false;
   if (!visionOnline()) return true;
@@ -425,22 +407,22 @@ void spinToward(float d, int speed) {          // d < 0 left, d > 0 right
 }
 
 void doSearch() {
-  if (sprayAllowed()) { enter(EXTINGUISH); return; }
+  if (sprayAllowed()) { enter(AIM); return; }
   if (fireNow())      { enter(TRACK); return; }
-  unsigned long t = inState() % (SEARCH_TURN_MS + SEARCH_PAUSE_MS);
-  if (t < SEARCH_TURN_MS) setMotors(SPEED_TURN, -SPEED_TURN); else stopMotors();
+  unsigned long t = inState() % (SEARCH_REVOLUTION_MS + SEARCH_PAUSE_MS);
+  if (t < SEARCH_REVOLUTION_MS) setMotors(SPEED_TURN, -SPEED_TURN);
+  else stopMotors();
 }
 
 void doTrack() {
-  if (sprayAllowed()) { enter(EXTINGUISH); return; }
+  if (sprayAllowed()) { enter(AIM); return; }
 
   if (fireNow()) lastEvidenceMs = millis();
   else if (millis() - lastEvidenceMs > LOST_MS) { enter(SEARCH); return; }
 
   if (fireNow() && distKnown() && vis.dist <= STOP_DIST_CM) { enter(APPROACH); return; }
 
-  bool usePlan = planFresh();
-  if (sen.dF < (usePlan ? PLAN_VETO_CM : OBSTACLE_CM)) {
+  if (sen.dF < OBSTACLE_CM) {
     // is the thing in front the fire itself?
     bool fireAhead = fireNow() && abs(vis.err) < 25 && (!distKnown() || vis.dist <= sen.dF + 30);
     enter(fireAhead ? APPROACH : AVOID);
@@ -449,10 +431,7 @@ void doTrack() {
 
   float d; int base;
   bool slow = (distKnown() && vis.dist < SLOW_DIST_CM) || sen.dF < 2 * OBSTACLE_CM;
-  if (usePlan) {
-    d = constrain((float)plan.heading / PLAN_FULL_TURN_DEG, -1.0, 1.0);
-    base = slow ? min(plan.speed, SPEED_SLOW) : plan.speed;
-  } else if (fireNow()) {
+  if (fireNow()) {
     d = vis.err / 100.0;
     base = slow ? SPEED_SLOW : SPEED_FWD;
   } else {                // camera briefly lost fire: keep going straight, slowly
@@ -486,7 +465,7 @@ void doAvoid() {
 
 // Fire is close. Line up with it and creep in until the flame sensor fires.
 void doApproach() {
-  if (sprayAllowed()) { enter(EXTINGUISH); return; }
+  if (sprayAllowed()) { enter(AIM); return; }
 
   if (!fireRecent()) {                                   // lost it
     if (inState() > LOST_MS) enter(SEARCH);
@@ -502,6 +481,31 @@ void doApproach() {
   }
   bool roomAhead = sen.dF > CREEP_MIN_CM && (!distKnown() || vis.dist > 15);
   if (roomAhead) setMotors(SPEED_CREEP, SPEED_CREEP); else stopMotors();
+}
+
+// Stop, point the arm/nozzle at the target, and allow it to settle before the
+// pump can be activated. USE_SERVO must be enabled and calibrated on hardware.
+void doAim() {
+  stopMotors();
+  setPump(false);
+#if !USE_SERVO
+  // Fail safe: do not spray if the arm/nozzle actuator is not configured.
+  if (!sen.flame) enter(fireRecent() ? TRACK : SEARCH);
+  return;
+#else
+  if (!sprayAllowed()) {
+    if (fireNow() && distKnown() && vis.dist <= STOP_DIST_CM) enter(APPROACH);
+    else if (fireRecent()) enter(TRACK);
+    else enter(SEARCH);
+    return;
+  }
+
+  int offset = fireNow()
+      ? constrain(vis.err * SERVO_RANGE / 100, -SERVO_RANGE, SERVO_RANGE)
+      : 0;
+  aimNozzle(offset);
+  if (inState() >= ARM_AIM_MS) enter(EXTINGUISH);
+#endif
 }
 
 void doExtinguish() {
@@ -520,7 +524,7 @@ void doVerify() {
   aimNozzle(0);
   if (inState() < VERIFY_MS) return;
   if (burstCount < MAX_BURSTS) {
-    if (sprayAllowed()) { enter(EXTINGUISH); return; }
+    if (sprayAllowed()) { enter(AIM); return; }
     if (fireNow()) { enter(distKnown() && vis.dist <= STOP_DIST_CM ? APPROACH : TRACK); return; }
   }
   firesPutOut++;
@@ -529,7 +533,7 @@ void doVerify() {
 
 // Drive by keys; flame sensor still triggers the pump automatically.
 void doManual() {
-  if (sprayAllowed()) { enter(EXTINGUISH); return; }
+  if (sprayAllowed()) { enter(AIM); return; }
   setMotors(manualL, manualR);
 }
 
@@ -541,6 +545,7 @@ void drawOled() {
   bool blinkOn = (millis() / 300) % 2;
 
   switch (state) {
+    case AIM:        strcpy(big, "Aiming..."); break;
     case EXTINGUISH: strcpy(big, "SPRAYING!"); break;
     case SEARCH:     strcpy(big, sen.flame ? "FLAME!" : "Searching..."); break;
     case TRACK:
@@ -562,7 +567,7 @@ void drawOled() {
 #else
   strcpy(l3, "Sonar: off");
 #endif
-  bool alarm = (state == EXTINGUISH) || sen.flame;
+  bool alarm = (state == AIM) || (state == EXTINGUISH) || sen.flame;
 
   oled.firstPage();
   do {
@@ -599,6 +604,7 @@ void statusLed() {
     case TRACK: period = 300; break;
     case AVOID: period = 150; break;
     case APPROACH: period = 500; break;
+    case AIM:        period = 500; break;
     case EXTINGUISH: digitalWrite(PIN_LED, HIGH); return;
     case ESTOP: period = 80; break;
     default: break;
@@ -682,6 +688,7 @@ void loop() {
     case TRACK:      doTrack();      break;
     case AVOID:      doAvoid();      break;
     case APPROACH:   doApproach();   break;
+    case AIM:        doAim();        break;
     case EXTINGUISH: doExtinguish(); break;
     case VERIFY:     doVerify();     break;
     case ESTOP:      stopMotors(); setPump(false); if (!estopRequested) enter(SEARCH); break;

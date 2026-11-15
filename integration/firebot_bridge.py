@@ -1,35 +1,31 @@
-"""
-firebot_bridge.py  —  put this file in the ROOT of the fire_fighting_robot repo
-(next to detector.py).
+"""Bridge the repository fire detector to the FireBot Arduino controller.
 
 Connects THIS repo's fire detection (detector.FireDetector) to the robot car:
 
     webcam -> FireDetector.detect()  (YOLO + temporal confirmation + bbox/center)
            -> direction  (err  -100 .. +100)
            -> distance   (cm, calibrated)
-           -> USB serial -> Arduino running fire_bot.ino
+           -> USB serial -> Arduino running fire_bot/fire_bot.ino
                               (drives motors, avoids obstacles, flame sensor -> relay -> pump, OLED)
 
 Messages sent to the Arduino (one per line):
     F,<err>,<dist_cm>,<conf>   confirmed fire (dist 999 = unknown)
-    P,<heading>,<speed>        A* path heading (only if floor calibration + planner.py present)
     N                          no confirmed fire
     X / G                      emergency stop / go
-    w a s d x / A              manual drive / back to auto
+    w a s d x / r              manual drive / back to auto
 
 Arduino replies every 200 ms (shown on screen + printed here, this is your "serial monitor"):
     S,<state>,<dF>,<dL>,<dR>,<flame>,<vision>,<dist>,<pump>
 
 Run (from repo root, venv active):
-    python firebot_bridge.py --port COM5                 # robot
-    python firebot_bridge.py --no-serial                 # camera only, no Arduino
-    python firebot_bridge.py --port COM5 --camera 0      # other webcam index
+    python integration/firebot_bridge.py --port COM5
+    python integration/firebot_bridge.py --no-serial
+    python integration/firebot_bridge.py --port COM5 --camera 0
 
 Keys (click the video window first):
     space  E-stop on/off           q / Esc  quit (robot stops)
     w a s d x  manual drive         r  back to AUTO
-    c  size-distance calibration point (fire at --ref-dist cm)
-    f / l  learn / lock floor colour (floor planner only)
+    c      add a size-distance calibration point
 
 NOTE: close Arduino IDE's Serial Monitor first - only one program can use the port.
 """
@@ -37,12 +33,20 @@ NOTE: close Arduino IDE's Serial Monitor first - only one program can use the po
 import argparse
 import json
 import math
-import os
+import sys
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+# Support running this script directly from the integration folder or from
+# any working directory while importing the detector kept in the repo root.
+INTEGRATION_DIR = Path(__file__).resolve().parent
+REPO_ROOT = INTEGRATION_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from detector import FireDetector
 
@@ -50,12 +54,6 @@ try:
     import serial
 except ImportError:
     serial = None
-
-try:                              # optional: copied from FireBot package
-    from planner import FloorPlanner, load_calibration
-except ImportError:
-    FloorPlanner = None
-
 
 # ---------------------------------------------------------------- distance
 class DistanceEstimator:
@@ -65,19 +63,20 @@ class DistanceEstimator:
     none  : 999 (Arduino then relies on flame sensor + ultrasonics to stop).
     """
 
-    def __init__(self, planner=None, size_file="size_calib.json"):
-        self.planner = planner
-        self.size_file = size_file
+    def __init__(self, floor_homography=None, size_file=None):
+        self.floor_homography = (np.asarray(floor_homography, dtype=np.float64)
+                                 if floor_homography is not None else None)
+        self.size_file = Path(size_file) if size_file else INTEGRATION_DIR / "size_calib.json"
         self.points, self.a, self.b = [], None, None
-        if os.path.exists(size_file):
-            with open(size_file) as f:
+        if self.size_file.exists():
+            with self.size_file.open() as f:
                 self.points = [tuple(p) for p in json.load(f)["points"]]
             self._fit()
         self.hist = deque(maxlen=5)
 
     @property
     def method(self):
-        if self.planner:
+        if self.floor_homography is not None:
             return "FLOOR"
         return f"SIZE({len(self.points)}pt)" if self.a is not None else "none"
 
@@ -95,10 +94,12 @@ class DistanceEstimator:
     def update(self, bbox):
         x1, y1, x2, y2 = bbox
         d = None
-        if self.planner is not None:
-            fx, fy = self.planner.img_to_cm((x1 + x2) / 2, y2)
-            if fy > 0:
-                d = math.hypot(fx, fy)
+        if self.floor_homography is not None:
+            point = self.floor_homography @ np.array([(x1 + x2) / 2, y2, 1.0])
+            if abs(point[2]) > 1e-9:
+                fx, fy = point[0] / point[2], point[1] / point[2]
+                if fy > 0:
+                    d = math.hypot(fx, fy)
         if d is None and self.a is not None:
             d = self.a / max(4.0, y2 - y1) + self.b
         if d is None:
@@ -113,7 +114,7 @@ class DistanceEstimator:
         h = bbox[3] - bbox[1]
         self.points = [p for p in self.points if abs(p[1] - ref_dist) > 1] + [(h, ref_dist)]
         self._fit()
-        with open(self.size_file, "w") as f:
+        with self.size_file.open("w") as f:
             json.dump({"points": self.points, "a": self.a, "b": self.b}, f, indent=2)
         print(f"[CAL] box {h}px at {ref_dist:.0f} cm saved ({len(self.points)} point(s); use 2+, e.g. 50 & 150 cm)")
 
@@ -122,11 +123,9 @@ class DistanceEstimator:
 class Bridge:
     """Turns one FireDetector.detect() result into protocol lines."""
 
-    def __init__(self, dist_est, planner=None):
+    def __init__(self, dist_est):
         self.dist = dist_est
-        self.planner = planner
         self.smooth_err = 0.0
-        self.smooth_head = None
         self.last_dist = 999
 
     @staticmethod
@@ -137,31 +136,20 @@ class Bridge:
         return None
 
     def messages(self, fire, frame):
-        h, w = frame.shape[:2]
-        msgs, fire_px = [], None
+        _, w = frame.shape[:2]
+        msgs = []
         s = self.fire_target(fire)
         if s is not None:
-            x1, y1, x2, y2 = s["bbox"]
             cx = s["center"][0]
             err = (cx / w - 0.5) * 200.0
             self.smooth_err = 0.6 * self.smooth_err + 0.4 * err
             self.last_dist = self.dist.update(s["bbox"])
             msgs.append(f"F,{int(round(self.smooth_err))},{self.last_dist},{int(round(s['confidence'] * 100))}")
-            fire_px = ((x1 + x2) / 2.0, float(y2))
         else:
             msgs.append("N")
             self.dist.reset()
-            self.smooth_head = None
             self.last_dist = 999
-
-        plan = None
-        if self.planner is not None:
-            plan = self.planner.plan(frame, fire_px)
-            if plan["heading"] is not None:
-                hd = plan["heading"]
-                self.smooth_head = hd if self.smooth_head is None else 0.5 * self.smooth_head + 0.5 * hd
-                msgs.append(f"P,{int(round(max(-90, min(90, self.smooth_head))))},{plan['speed']}")
-        return msgs, plan
+        return msgs
 
 
 def parse_telemetry(line):
@@ -179,17 +167,16 @@ def parse_telemetry(line):
 def parse_args():
     ap = argparse.ArgumentParser(description="FireDetector -> FireBot Arduino bridge")
     ap.add_argument("--camera", default="1", help="webcam index (repo default 1) or stream URL")
-    ap.add_argument("--model", default="models/fire_weights.pt")
+    ap.add_argument("--model", default=str(REPO_ROOT / "models" / "fire_weights.pt"))
     ap.add_argument("--conf", type=float, default=0.35)
     ap.add_argument("--frames", type=int, default=3, help="consecutive frames to confirm fire")
     ap.add_argument("--device", default="auto", help="auto / cpu / 0")
     ap.add_argument("--port", help="Arduino port: COM5, /dev/ttyACM0 ...")
     ap.add_argument("--baud", type=int, default=115200, help="115200 USB, 9600 HC-05")
     ap.add_argument("--no-serial", action="store_true")
-    ap.add_argument("--calib", default="floor_calib.json", help="floor calibration -> FLOOR distance + A*")
-    ap.add_argument("--no-plan", action="store_true")
+    ap.add_argument("--calib", default=str(INTEGRATION_DIR / "floor_calib.json"),
+                    help="optional camera-to-floor calibration for distance estimates")
     ap.add_argument("--ref-dist", type=float, default=100, help="cm, for key 'c'")
-    ap.add_argument("--robot-width", type=float, default=24)
     return ap.parse_args()
 
 
@@ -207,12 +194,15 @@ def open_serial(port, baud):
 def main():
     args = parse_args()
 
-    planner = None
-    if FloorPlanner is not None and not args.no_plan and os.path.exists(args.calib):
-        H, _ = load_calibration(args.calib)
-        planner = FloorPlanner(H, robot_half_width_cm=args.robot_width / 2)
-    dist_est = DistanceEstimator(planner)
-    bridge = Bridge(dist_est, planner)
+    floor_homography = None
+    calibration_path = Path(args.calib)
+    if calibration_path.exists():
+        with calibration_path.open() as f:
+            floor_homography = json.load(f).get("H")
+        if floor_homography is None:
+            raise SystemExit(f"Calibration file has no 'H' matrix: {calibration_path}")
+    dist_est = DistanceEstimator(floor_homography)
+    bridge = Bridge(dist_est)
     print(f"[DIST] method: {dist_est.method}"
           + ("" if dist_est.method != "none" else "  (press 'c' with fire at --ref-dist cm to calibrate)"))
 
@@ -250,7 +240,7 @@ def main():
                 continue
 
             fire = detector.detect(frame)
-            msgs, plan = bridge.messages(fire, frame)
+            msgs = bridge.messages(fire, frame)
             for m in msgs:
                 send(m)
 
@@ -301,9 +291,6 @@ def main():
             if estop:
                 cv2.putText(vis, "E-STOP", (w - 140, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
             cv2.imshow("FireBot bridge", vis)
-            if plan is not None:
-                cv2.imshow("FireBot map (top-down)", planner.render(plan))
-
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
@@ -315,16 +302,12 @@ def main():
                 send(chr(key))
             if key == ord("r"):
                 manual = False
-                send("A")
+                send("R")
             if key == ord("c"):
                 if target is None:
                     print(f"\n[CAL] no confirmed fire - put fire at {args.ref_dist:.0f} cm first")
                 else:
                     dist_est.add_point(target["bbox"], args.ref_dist)
-            if planner is not None and key == ord("f"):
-                planner.sample_floor(frame)
-            if planner is not None and key == ord("l"):
-                planner.adaptive_floor = not planner.adaptive_floor
     finally:
         if ser:
             ser.write(b"X\n")           # leave robot stopped

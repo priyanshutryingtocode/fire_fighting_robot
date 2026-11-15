@@ -1,81 +1,121 @@
-# Connecting `fire_fighting_robot` (fire detection) to the FireBot car
+# FireBot integration
 
-## What goes where
+This folder connects the repository's `detector.py` to the FireBot Arduino
+firmware. The scripts import `detector.py` from the repository root, so you can
+run them from the repository root or from this folder without copying files.
 
-Copy these into the **root of the `fire_fighting_robot` repo** (next to `detector.py`):
+## Files and data flow
 
-```
-fire_fighting_robot/
-├── detector.py            (theirs, unchanged - YOLO + confirmation)
-├── firebot_bridge.py      NEW  detector -> USB serial -> Arduino
-├── planner.py             NEW  (optional) A* path planner
-├── calibrate_floor.py     NEW  (optional) floor calibration for distance + A*
-└── fire_bot/fire_bot.ino  NEW  upload THIS to the Arduino (not arduino/robot_controller.ino)
-```
-
-Why not the repo's `arduino/robot_controller.ino`? It's a scaffold: turning disabled, no relay/pump/OLED, and IN3/IN4 on pins 9/10 clash with relay/servo. `fire_bot.ino` has the full state machine (search -> drive -> avoid -> stop -> flame sensor -> relay -> pump), the OLED, and the safety rules.
-
-## Data flow
-
-```
-webcam ─▶ FireDetector.detect(frame)          (repo code: YOLO, 3-frame confirmation)
-            │  strongest fire box, confidence
-            ▼
-         firebot_bridge.py
-            │  err  = fire centre left/right  (-100..+100)
-            │  dist = cm (floor or size calibration)
-            ▼  USB serial 115200, ~10-30 lines/s
-         "F,-20,85,82"  or  "N"
-            ▼
-         Arduino fire_bot.ino ─▶ motors (L298N), flame sensor, relay ─▶ pump, OLED
-            │
-            └─▶ "S,TRACK,400,400,400,0,F,85,0"  (telemetry, shown in bridge window/console)
+```text
+webcam -> FireDetector -> firebot_bridge.py -> USB serial -> fire_bot/fire_bot.ino
+                                  |                            |
+                                  +-- distance calibration     +-- motors, sonar,
+                                                                  flame sensor, relay,
+                                                                  OLED
 ```
 
-The Arduino IDE is only for **uploading**. While running, Python owns the USB port, so **close Serial Monitor**. The bridge console shows what Serial Monitor would.
+- `firebot_bridge.py` detects and confirms fire, sends direction, confidence,
+  and estimated distance, and displays Arduino telemetry.
+- `calibrate_floor.py` maps image points to floor coordinates. This is used
+  only to estimate fire distance; it does not plan routes.
+- `fire_bot/fire_bot.ino` performs camera-based tracking, ultrasonic obstacle
+  avoidance, close approach, arm/nozzle aiming, flame-sensor verification, and
+  pump control. After extinguishing and verification it returns to SEARCH.
 
-## Steps
+The intended cycle is: timed in-place scan -> confirmed fire -> center and
+track -> avoid obstacles and reacquire the fire -> creep until the flame sensor
+detects it -> stop and aim the arm/nozzle -> pump -> verify -> scan again.
+`SEARCH_REVOLUTION_MS` must be calibrated to the robot's measured 360-degree
+turn time; without wheel encoders or a compass, timed rotation is approximate.
 
-1. **Arduino**: open `fire_bot/fire_bot.ino`, check the settings block at the top (`USE_ULTRASONIC`, `RELAY_ACTIVE_LOW`, motor inverts — same as your test sketches), upload. Close Serial Monitor.
-2. **Laptop** (repo venv active):
-   ```
-   pip install pyserial
-   ```
-3. **Camera only** (no robot):
-   ```
-   python firebot_bridge.py --no-serial
-   ```
-   Fire box should go red and status says `FIRE CONFIRMED`. Wrong camera → `--camera 0`.
-4. **Distance calibration** (pick one):
-   - Size (quick): fire 50 cm from bumper → `python firebot_bridge.py --no-serial --ref-dist 50` → press `c`. Fire at 150 cm → same with `--ref-dist 150` → `c`. Saved to `size_calib.json`.
-   - Floor (best, also enables A*): `python calibrate_floor.py --cam 1 --near 30 --size 40` (see FireBot README).
-5. **Robot, wheels in the air**:
-   ```
-   python firebot_bridge.py --port COM5
-   ```
-   Window shows `ROBOT: SEARCH ...` = Arduino is talking. Show fire → state becomes TRACK, wheels steer toward it.
-6. **Floor run**: robot on floor, candle 2 m away in a tray, water nearby.
+## Run from the repository root
 
-## Keys (click the video window first)
+Install the integration dependencies if needed:
+
+```powershell
+python -m pip install ultralytics opencv-python numpy pyserial
+```
+
+Camera only:
+
+```powershell
+python integration/firebot_bridge.py --no-serial
+```
+
+Connect to an Arduino (close Arduino IDE Serial Monitor first):
+
+```powershell
+python integration/firebot_bridge.py --port COM5
+```
+
+Use `--camera 0` to choose another camera. The default model path points to
+`models/fire_weights.pt` in the repository root. You can override it with
+`--model path/to/weights.pt`.
+
+## Distance calibration
+
+For floor-based distance, mount and aim the camera, then calibrate four tape
+corners on the floor:
+
+```powershell
+python integration/calibrate_floor.py --cam 1 --near 30 --size 40
+```
+
+Freeze with `p`, click near-left, near-right, far-right, far-left, then press
+`s`. The default output is `integration/floor_calib.json`; the bridge loads it
+automatically. Recalibrate if the camera moves.
+
+Alternatively, gather at least two fire-box-size samples at known distances by
+running the bridge with `--ref-dist 50`, pressing `c`, then repeating at another
+distance. Samples are saved as `integration/size_calib.json`.
+
+## Controls
+
+Click the video window before using the bridge keys:
 
 | Key | Action |
-|---|---|
-| space | E-stop on/off |
-| w a s d x | manual drive (forward / left / back / right / stop) |
-| r | back to AUTO |
-| c | add size-calibration point (fire at `--ref-dist`) |
-| q / Esc | quit (robot stops) |
+| --- | --- |
+| Space | Toggle emergency stop |
+| `w`, `a`, `s`, `d`, `x` | Manual forward, left, reverse, right, stop |
+| `r` | Return to automatic mode |
+| `c` | Save a size calibration sample at `--ref-dist` |
+| `q` or Esc | Quit; the bridge sends an emergency stop |
 
-## Options
+The bridge protocol sends only `F` (confirmed fire), `N` (no confirmed fire),
+and emergency/manual commands. The Arduino handles alignment, forward motion,
+obstacle avoidance, and suppression locally. Distance calibration improves
+the firmware's approach decisions but does not replace sensor checks.
 
-`--camera 1` (repo default) · `--model models/fire_weights.pt` · `--conf 0.35` · `--frames 3` (confirmation frames) · `--device auto|cpu|0` · `--baud 9600` for HC-05 Bluetooth.
+### Control from Arduino IDE Serial Monitor
 
-## Troubleshooting
+Close the Python bridge first because it owns the Arduino serial port. Open
+Serial Monitor at **115200 baud** with line ending set to **Newline**, then send
+one command at a time:
 
-| Problem | Fix |
-|---|---|
-| `could not open port` | Serial Monitor still open, or wrong COM port (Arduino IDE → Tools → Port shows it) |
-| Window says `no telemetry yet` | wrong port / baud, or old sketch on Arduino |
-| Robot state stays SEARCH with fire visible | fire not confirmed: check status line, lower `--conf`, `--frames 2` |
-| Robot shows camera offline (`-`) on OLED | detection too slow: use GPU (`--device 0`) — firmware treats >0.8 s silence as offline |
-| Steers the wrong way | swap `INVERT_LEFT_MOTOR`/`INVERT_RIGHT_MOTOR`, or camera mounted upside down |
+| Command | Action |
+| --- | --- |
+| `W` | Forward |
+| `A` | Turn left in place |
+| `S` | Reverse |
+| `D` | Turn right in place |
+| `x` | Stop motors and remain in manual mode |
+| `r` | Return to automatic search |
+| `X` | Latch software emergency stop |
+| `G` | Clear software emergency stop |
+
+Movement commands remain active until another command is sent. Send `x` to
+stop before changing modes. `X` is the emergency stop; it is distinct from the
+lowercase `x` manual stop. Keep a physical power cutoff within reach.
+
+## Hardware configuration
+
+Before uploading `fire_bot/fire_bot.ino`, verify the pin map, motor direction,
+flame sensor polarity, relay polarity, and driver type against the actual
+hardware. The sketch defaults to `CALIBRATION_MODE 0` and
+`USE_ULTRASONIC 0` and `USE_SERVO 0`. Configure and verify these for the actual
+hardware before operation. With `USE_SERVO 0`, the firmware will hold in AIM
+while the flame sensor is active and will not activate the pump. Only enable the servo after checking its
+mechanism, pin, travel limits, and the `SERVO_CENTER`/`SERVO_RANGE` calibration.
+Test with the pump disconnected and wheels raised. The example can activate a
+pump from its flame sensor, including when the laptop is offline. Do not test
+near a real flame.
