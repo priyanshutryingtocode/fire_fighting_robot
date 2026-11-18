@@ -28,7 +28,7 @@
  *    SEARCH     spin in small steps until the camera sees fire
  *    TRACK      drive toward fire using camera direction,
  *               slow down as distance drops, avoid obstacles with ultrasonics
- *    AVOID      back up, turn to the freer side, drive past, resume TRACK
+ *    AVOID      stop, pivot toward the freer measured side, pass, resume TRACK
  *    APPROACH   fire is close (camera dist <= STOP_DIST_CM): centre on it and
  *               creep forward until the flame sensor fires
  *    AIM        stop, point nozzle/arm toward the fire, then settle
@@ -449,18 +449,49 @@ void doTrack() {
 void doAvoid() {
   unsigned long t = millis() - avoidPhaseMs;
   switch (avoidPhase) {
-    case 0:  setMotors(-SPEED_SLOW, -SPEED_SLOW);
-             if (t > 300) { avoidPhase = 1; avoidPhaseMs = millis(); } break;
-    case 1:  setMotors(avoidDir * SPEED_TURN, -avoidDir * SPEED_TURN);
-             if ((sen.dF > CLEAR_CM && t > 250) || t > 1500) { avoidPhase = 2; avoidPhaseMs = millis(); } break;
-    case 2:  if (sen.dF < OBSTACLE_CM) { avoidPhase = 0; avoidPhaseMs = millis(); break; }
-             setMotors(SPEED_FWD, SPEED_FWD);
-             if (t > 700) { avoidPhase = 3; avoidPhaseMs = millis(); } break;
-    case 3:  setMotors(-avoidDir * SPEED_TURN, avoidDir * SPEED_TURN);
-             if (t > 350 || fireNow()) { if (fireNow() || fireRecent()) enter(TRACK); else enter(SEARCH); }
-             break;
+    case 0:
+      // Pause before turning. This version has no rear sensor, so it never
+      // reverses blindly into an unmeasured area.
+      stopMotors();
+      if (t > 100) { avoidPhase = 1; avoidPhaseMs = millis(); }
+      break;
+    case 1: {
+      bool leftClear = sen.dL > SIDE_MIN_CM;
+      bool rightClear = sen.dR > SIDE_MIN_CM;
+      if (!leftClear && !rightClear) {
+        stopMotors();
+        avoidPhaseMs = millis();
+        break;
+      }
+      if (avoidDir < 0 && !leftClear) avoidDir = 1;
+      if (avoidDir > 0 && !rightClear) avoidDir = -1;
+      setMotors(avoidDir * SPEED_TURN, -avoidDir * SPEED_TURN);
+      if (sen.dF > CLEAR_CM && t > 250) {
+        avoidPhase = 2;
+        avoidPhaseMs = millis();
+      } else if (t > 1500) {
+        avoidPhaseMs = millis();  // keep turning in measured clear space
+      }
+      break;
+    }
+    case 2:
+      if ((avoidDir < 0 && sen.dL <= SIDE_MIN_CM)
+          || (avoidDir > 0 && sen.dR <= SIDE_MIN_CM)) {
+        avoidPhase = 0;
+        avoidPhaseMs = millis();
+        stopMotors();
+        break;
+      }
+      if (sen.dF <= OBSTACLE_CM) {
+        avoidPhase = 0;
+        avoidPhaseMs = millis();
+        stopMotors();
+        break;
+      }
+      setMotors(SPEED_SLOW, SPEED_SLOW);
+      if (t > 700) enter(fireNow() || fireRecent() ? TRACK : SEARCH);
+      break;
   }
-  if (inState() > 6000) enter(SEARCH);
 }
 
 // Fire is close. Line up with it and creep in until the flame sensor fires.
@@ -473,6 +504,14 @@ void doApproach() {
   }
   if (fireNow() && distKnown() && vis.dist > STOP_DIST_CM + 25) { enter(TRACK); return; }  // drifted away
   if (inState() > CREEP_MAX_MS) { enter(SEARCH); return; }  // flame sensor never fired
+
+  if (sen.dF <= OBSTACLE_CM) {
+    // A centered, nearby fire may be the sonar return. Otherwise treat it as
+    // an obstacle before pivoting or creeping in the close-approach phase.
+    bool fireIsAhead = fireNow() && abs(vis.err) <= CENTRE_ERR
+        && (!distKnown() || vis.dist <= sen.dF + 30);
+    if (!fireIsAhead) { enter(AVOID); return; }
+  }
 
   if (fireNow() && abs(vis.err) > CENTRE_ERR) {          // centre the fire first
     // short turn pulses so we don't overshoot
@@ -641,7 +680,7 @@ void setup() {
 #if LINK_BLUETOOTH
   LINK.begin(LINK_BAUD);
 #endif
-  LINK.println(F("# FireBot v2 ready. Manual keys: w a s d x, A = auto"));
+  LINK.println(F("# FireBot ready. WASD=manual, x=stop, r=auto, X=E-stop"));
 #if USE_OLED
   oled.begin();
   oled.setBusClock(400000);

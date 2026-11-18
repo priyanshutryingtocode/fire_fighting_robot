@@ -197,8 +197,8 @@ def main():
     floor_homography = None
     calibration_path = Path(args.calib)
     if calibration_path.exists():
-        with calibration_path.open() as f:
-            floor_homography = json.load(f).get("H")
+        with calibration_path.open(encoding="utf-8") as stream:
+            floor_homography = json.load(stream).get("H")
         if floor_homography is None:
             raise SystemExit(f"Calibration file has no 'H' matrix: {calibration_path}")
     dist_est = DistanceEstimator(floor_homography)
