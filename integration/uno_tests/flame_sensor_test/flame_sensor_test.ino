@@ -8,7 +8,7 @@ const bool FLAME_AO_LOW_IS_FIRE = true;
 const int FLAME_AO_THRESHOLD = 500;
 
 void setup() {
-  pinMode(PIN_FLAME, INPUT);
+  pinMode(PIN_FLAME, INPUT_PULLUP);
   pinMode(PIN_STATUS_LED, OUTPUT);
   Serial.begin(115200);
   Serial.println(F("Flame sensor test started; inspect readings and adjust polarity/threshold."));

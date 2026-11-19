@@ -9,13 +9,13 @@ Connects THIS repo's fire detection (detector.FireDetector) to the robot car:
                               (drives motors, avoids obstacles, flame sensor -> relay -> pump, OLED)
 
 Messages sent to the Arduino (one per line):
-    F,<err>,<dist_cm>,<conf>   confirmed fire (dist 999 = unknown)
+    F,<err_x>,<err_y>,<dist_cm>,<conf>   confirmed fire (dist 999 = unknown)
     N                          no confirmed fire
     X / G                      emergency stop / go
     w a s d x / r              manual drive / back to auto
 
 Arduino replies every 200 ms (shown on screen + printed here, this is your "serial monitor"):
-    S,<state>,<dF>,<dL>,<dR>,<flame>,<vision>,<dist>,<pump>
+    S,<state>,<front_cm>,<flame>,<vision>,<dist>,<pump>
 
 Run (from repo root, venv active):
     python integration/firebot_bridge.py --port COM5
@@ -126,6 +126,7 @@ class Bridge:
     def __init__(self, dist_est):
         self.dist = dist_est
         self.smooth_err = 0.0
+        self.smooth_err_y = 0.0
         self.last_dist = 999
 
     @staticmethod
@@ -136,29 +137,41 @@ class Bridge:
         return None
 
     def messages(self, fire, frame):
-        _, w = frame.shape[:2]
+        h, w = frame.shape[:2]
         msgs = []
         s = self.fire_target(fire)
         if s is not None:
             cx = s["center"][0]
+            cy = s["center"][1]
             err = (cx / w - 0.5) * 200.0
+            err_y = (cy / h - 0.5) * 200.0
             self.smooth_err = 0.6 * self.smooth_err + 0.4 * err
+            self.smooth_err_y = 0.6 * self.smooth_err_y + 0.4 * err_y
             self.last_dist = self.dist.update(s["bbox"])
-            msgs.append(f"F,{int(round(self.smooth_err))},{self.last_dist},{int(round(s['confidence'] * 100))}")
+            msgs.append(
+                f"F,{int(round(self.smooth_err))},{int(round(self.smooth_err_y))},"
+                f"{self.last_dist},{int(round(s['confidence'] * 100))}"
+            )
         else:
             msgs.append("N")
             self.dist.reset()
             self.last_dist = 999
+            self.smooth_err = self.smooth_err_y = 0.0
         return msgs
 
 
 def parse_telemetry(line):
     p = line.split(",")
-    if len(p) < 9 or p[0] != "S":
+    if p[0] != "S":
         return None
     try:
-        return {"state": p[1], "dF": int(p[2]), "dL": int(p[3]), "dR": int(p[4]),
-                "flame": p[5] == "1", "vision": p[6], "dist": int(p[7]), "pump": p[8] == "1"}
+        if len(p) >= 9:  # older three-sonar telemetry
+            return {"state": p[1], "dF": int(p[2]), "dL": int(p[3]), "dR": int(p[4]),
+                    "flame": p[5] == "1", "vision": p[6], "dist": int(p[7]), "pump": p[8] == "1"}
+        if len(p) >= 7:  # one-front-sonar telemetry
+            return {"state": p[1], "dF": int(p[2]), "dL": None, "dR": None,
+                    "flame": p[3] == "1", "vision": p[4], "dist": int(p[5]), "pump": p[6] == "1"}
+        return None
     except ValueError:
         return None
 
@@ -281,7 +294,7 @@ def main():
             if telem:
                 lines.append(f"ROBOT: {telem['state']}  flame:{'YES' if telem['flame'] else 'no'}"
                              f"  pump:{'ON' if telem['pump'] else 'off'}")
-                lines.append(f"sonar F{telem['dF']} L{telem['dL']} R{telem['dR']}")
+                lines.append(f"front sonar: {telem['dF']} cm")
             elif ser:
                 lines.append("ROBOT: no telemetry yet")
             if manual:

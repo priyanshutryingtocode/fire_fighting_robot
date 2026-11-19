@@ -1,55 +1,68 @@
 /*
- * Standalone single-servo arm/nozzle test on the FireBot servo pin.
- * Detach/clear the arm linkage before discovering safe travel limits.
- * Serial Monitor: 115200 baud, Newline. Send an angle (for example 80) or C.
+ * Standalone two-axis FireBot arm test.
+ * Pan/horizontal servo: D9 (same as the pump test). Tilt/base servo: D4.
+ * Remove the arm linkage or keep clear while identifying safe angle limits.
+ * Serial Monitor: 115200 baud, Newline. Commands: P 90, T 90, C (both home).
  */
 
 #include <Servo.h>
 
-const uint8_t PIN_SERVO = 9;
-const int SERVO_MIN_SAFE = 60;   // adjust only after checking the linkage
-const int SERVO_MAX_SAFE = 120;  // adjust only after checking the linkage
-const int SERVO_HOME = 90;
+const uint8_t PIN_PAN_SERVO = 9;
+const uint8_t PIN_TILT_SERVO = 4;
+const int PAN_HOME = 90, TILT_HOME = 90;
+const int PAN_MIN_SAFE = 55, PAN_MAX_SAFE = 125;
+const int TILT_MIN_SAFE = 60, TILT_MAX_SAFE = 120;
 
-Servo armServo;
-char inputLine[12];
-uint8_t inputLength = 0;
+Servo panServo, tiltServo;
+char lineBuffer[16];
+uint8_t lineLength = 0;
 
 void applyCommand() {
-  inputLine[inputLength] = '\0';
-  if (inputLength == 1 && (inputLine[0] == 'c' || inputLine[0] == 'C')) {
-    armServo.write(SERVO_HOME);
-    Serial.print(F("home=")); Serial.println(SERVO_HOME);
+  lineBuffer[lineLength] = '\0';
+  if ((lineBuffer[0] == 'C' || lineBuffer[0] == 'c') && lineLength == 1) {
+    panServo.write(PAN_HOME);
+    tiltServo.write(TILT_HOME);
+    Serial.println(F("both servos -> home"));
     return;
   }
+  char axis = lineBuffer[0];
+  if (axis >= 'a' && axis <= 'z') axis -= ('a' - 'A');
   char* endPtr;
-  long angle = strtol(inputLine, &endPtr, 10);
-  if (endPtr == inputLine || *endPtr != '\0') {
-    Serial.println(F("Send a numeric angle or C for home."));
+  long requested = strtol(lineBuffer + 1, &endPtr, 10);
+  if ((*endPtr != '\0') || (axis != 'P' && axis != 'T')) {
+    Serial.println(F("Use P <angle>, T <angle>, or C."));
     return;
   }
-  angle = constrain(angle, SERVO_MIN_SAFE, SERVO_MAX_SAFE);
-  armServo.write((int)angle);
-  Serial.print(F("commanded angle=")); Serial.println(angle);
+  if (axis == 'P') {
+    int angle = constrain(requested, PAN_MIN_SAFE, PAN_MAX_SAFE);
+    panServo.write(angle);
+    Serial.print(F("pan=")); Serial.println(angle);
+  } else {
+    int angle = constrain(requested, TILT_MIN_SAFE, TILT_MAX_SAFE);
+    tiltServo.write(angle);
+    Serial.print(F("tilt=")); Serial.println(angle);
+  }
 }
 
 void setup() {
   Serial.begin(115200);
-  armServo.attach(PIN_SERVO);
-  armServo.write(SERVO_HOME);
-  Serial.println(F("Servo test ready. Enter angle or C (home)."));
+  panServo.attach(PIN_PAN_SERVO, 544, 2400);
+  tiltServo.attach(PIN_TILT_SERVO, 544, 2400);
+  panServo.write(PAN_HOME);
+  tiltServo.write(TILT_HOME);
+  Serial.println(F("Dual servo test ready: P angle, T angle, C=home."));
 }
 
 void loop() {
   while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      if (inputLength) applyCommand();
-      inputLength = 0;
-    } else if (c != '\r' && inputLength < sizeof(inputLine) - 1) {
-      inputLine[inputLength++] = c;
-    } else if (inputLength >= sizeof(inputLine) - 1) {
-      inputLength = 0;
+    char ch = (char)Serial.read();
+    if (ch == '\n') {
+      if (lineLength) applyCommand();
+      lineLength = 0;
+    } else if (ch != '\r' && lineLength < sizeof(lineBuffer) - 1) {
+      lineBuffer[lineLength++] = ch;
+    } else if (lineLength >= sizeof(lineBuffer) - 1) {
+      lineLength = 0;
     }
   }
 }

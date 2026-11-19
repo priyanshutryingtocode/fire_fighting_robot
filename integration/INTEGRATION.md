@@ -1,127 +1,79 @@
-# FireBot integration
+# FireBot dual-servo integration
 
-This folder connects the repository's `detector.py` to the FireBot Arduino
-firmware. The scripts import `detector.py` from the repository root, so you can
-run them from the repository root or from this folder without copying files.
+The camera detector runs on the laptop. The Arduino Uno receives confirmed
+fire center and distance over serial, steers the car using the fire's horizontal
+camera error, avoids obstacles using one front ultrasonic sensor, and aims the
+two arm servos before controlling the pump. There is no global map or A* planner.
 
-## Files and data flow
+## Wiring used by the complete sketch
 
-```text
-webcam -> FireDetector -> firebot_bridge.py -> USB serial -> fire_bot/fire_bot.ino
-                                  |                            |
-                                  +-- distance calibration     +-- motors, sonar,
-                                                                  flame sensor, relay,
-                                                                  OLED
-```
+| Part | Arduino connection |
+| --- | --- |
+| Flame sensor digital OUT | A0, active LOW |
+| Relay input | D10, active LOW |
+| Pan servo (left/right) | D9, same servo signal as the pump test |
+| Tilt/base servo (up/down) | D4 |
+| Front HC-SR04 TRIG | D2 |
+| Front HC-SR04 ECHO with L298N | D3 |
+| Front HC-SR04 ECHO with L293D board | D7 |
+| OLED SH1106 | SDA A4, SCL A5 |
+| Status LED | D13 |
 
-- `firebot_bridge.py` detects and confirms fire, sends direction, confidence,
-  and estimated distance. Fire-center offset drives local visual steering; the
-  Uno uses that offset to turn and move toward the target.
-- `calibrate_floor.py` maps image points to floor coordinates. This is used
-  only for an optional floor-based distance estimate. Fire centering and
-  obstacle avoidance do not require this calibration.
-- `fire_bot/fire_bot.ino` performs camera-based tracking, ultrasonic obstacle
-  avoidance, close approach, arm/nozzle aiming, flame-sensor verification, and
-  pump control. After extinguishing and verification it returns to SEARCH.
+The motor pin map is selected by `MOTOR_DRIVER` near the top of
+`fire_bot/fire_bot.ino`: `0` is the separate-enable L298N map; `1` is the L293D
+board map. Verify all motor pins and motor inversion against your wiring.
 
-The intended cycle is: timed in-place scan -> confirmed fire -> keep the fire
-centered while moving -> use ultrasonic readings to avoid obstacles -> reacquire
-and center the fire -> creep until the flame sensor detects it -> stop and aim
-the arm/nozzle -> pump -> verify -> scan again.
-`SEARCH_REVOLUTION_MS` must be calibrated to the robot's measured 360-degree
-turn time; without wheel encoders or a compass, timed rotation is approximate.
+Use a separate regulated supply for both servos and connect that supply's
+ground to Arduino ground. Keep the pump on its separate battery through the
+relay as in the pump test. Check both servo travel limits with the linkage
+clear before attaching the arm. Adjust `PAN_MIN/MAX`, `TILT_MIN/MAX`, and the
+reversal flags to match the mechanism.
 
-## Run from the repository root
+## Behavior
 
-Install the integration dependencies if needed:
+1. At startup the car scans in place. `SEARCH_REVOLUTION_MS` is a timed estimate
+   of one 360-degree turn and must be calibrated on the actual floor.
+2. Laptop YOLO confirms fire and sends horizontal and vertical image offsets.
+   The car turns/moves to center the fire; the vertical offset is used to aim
+   the tilt servo.
+3. The one front sonar triggers local avoidance. The car stops, pivots briefly,
+   checks the front distance again, and tries the other direction if still
+   blocked. It does not reverse because there is no rear sensor.
+4. At close range the car creeps until the flame sensor confirms flame, then
+   stops. Pan and tilt aim, the pan servo sweeps while the pump runs, and the
+   flame sensor controls the spray hold and verification cycle.
+5. When the flame stays clear, the car returns to scanning.
 
-```powershell
-python -m pip install ultralytics opencv-python numpy pyserial
-```
+The serial vision packet is `F,<x_error>,<y_error>,<distance_cm>,<confidence>`;
+`N` means no confirmed fire. Camera centering works without floor calibration.
+Optional `integration/floor_calib.json` or size calibration supplies a distance
+estimate for approach/pump interlocks.
 
-Camera only:
+## Upload and run
 
-```powershell
-python integration/firebot_bridge.py --no-serial
-```
+Install the U8g2 library through Arduino IDE Library Manager if the OLED is
+enabled. Open `integration/fire_bot/fire_bot.ino`, select Arduino Uno and its
+port, verify the driver/pin settings, then upload. Close Serial Monitor before
+starting the laptop bridge because both cannot own the USB serial port.
 
-Connect to an Arduino (close Arduino IDE Serial Monitor first):
+From the repository root, run:
 
 ```powershell
 python integration/firebot_bridge.py --port COM5
 ```
 
-Fire centering works without floor calibration. The optional calibration
-improves fire-distance estimates, which the Arduino uses for approach and pump
-interlocks. Ultrasonic obstacle avoidance runs on the Arduino.
+Change `COM5` to the Arduino's port. Use `--camera 0` if needed. For camera-only
+preview, run `python integration/firebot_bridge.py --no-serial`.
 
-Use `--camera 0` to choose another camera. The default model path points to
-`models/fire_weights.pt` in the repository root. You can override it with
-`--model path/to/weights.pt`.
+## Commissioning
 
-## Distance calibration
+Test the standalone sketches in `integration/uno_tests` first. Then test this
+full sketch with motor wheels raised and pump disconnected. Confirm flame and
+sonar readings, motor directions, servo movement, relay polarity, and the stop
+command before connecting the pump. The front sensor cannot see obstacles
+behind or beside the car; supervise every movement and keep a physical power
+cutoff within reach. Do not test near a real flame.
 
-For floor-based distance, mount and aim the camera, then calibrate four tape
-corners on the floor:
-
-```powershell
-python integration/calibrate_floor.py --cam 1 --near 30 --size 40
-```
-
-Freeze with `p`, click near-left, near-right, far-right, far-left, then press
-`s`. The default output is `integration/floor_calib.json`; the bridge loads it
-automatically. Recalibrate if the camera moves.
-
-Alternatively, gather at least two fire-box-size samples at known distances by
-running the bridge with `--ref-dist 50`, pressing `c`, then repeating at another
-distance. Samples are saved as `integration/size_calib.json`.
-
-## Controls
-
-Click the video window before using the bridge keys:
-
-| Key | Action |
-| --- | --- |
-| Space | Toggle emergency stop |
-| `w`, `a`, `s`, `d`, `x` | Manual forward, left, reverse, right, stop |
-| `r` | Return to automatic mode |
-| `c` | Save a size calibration sample at `--ref-dist` |
-| `q` or Esc | Quit; the bridge sends an emergency stop |
-
-The bridge sends `F` with confirmed fire center, distance, and confidence, or
-`N` when there is no confirmed fire, plus emergency/manual commands. The Arduino
-uses the camera center offset for local steering and its ultrasonic sensors for
-obstacle avoidance. There is no room map or global route planner.
-
-### Control from Arduino IDE Serial Monitor
-
-Close the Python bridge first because it owns the Arduino serial port. Open
-Serial Monitor at **115200 baud** with line ending set to **Newline**, then send
-one command at a time:
-
-| Command | Action |
-| --- | --- |
-| `W` | Forward |
-| `A` | Turn left in place |
-| `S` | Reverse |
-| `D` | Turn right in place |
-| `x` | Stop motors and remain in manual mode |
-| `r` | Return to automatic search |
-| `X` | Latch software emergency stop |
-| `G` | Clear software emergency stop |
-
-Movement commands remain active until another command is sent. Send `x` to
-stop before changing modes. `X` is the emergency stop; it is distinct from the
-lowercase `x` manual stop. Keep a physical power cutoff within reach.
-
-## Hardware configuration
-
-Before uploading `fire_bot/fire_bot.ino`, verify the pin map, motor direction,
-flame sensor polarity, relay polarity, and driver type against the actual
-hardware. The sketch defaults to `CALIBRATION_MODE 0`, `USE_ULTRASONIC 0`, and
-`USE_SERVO 0`. Configure and verify these for the actual
-hardware before operation. With `USE_SERVO 0`, the firmware will hold in AIM
-while the flame sensor is active and will not activate the pump. Only enable the servo after checking its
-mechanism, pin, travel limits, and the `SERVO_CENTER`/`SERVO_RANGE` calibration.
-Test with the pump disconnected and wheels raised. Do not test near a real
-flame.
+Serial Monitor manual commands, when the bridge is closed: `W/A/S/D` drive,
+`x` stops, `r` returns to automatic mode, `X` latches the software emergency
+stop, and `G` clears it. Commands require Newline at 115200 baud.

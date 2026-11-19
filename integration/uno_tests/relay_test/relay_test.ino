@@ -5,7 +5,7 @@
  */
 
 const uint8_t PIN_RELAY = 10;
-const bool RELAY_ACTIVE_LOW = false;  // match the relay module; verify before connecting a pump
+const bool RELAY_ACTIVE_LOW = true;   // matches the pasted FireBot pump test; verify on your module
 const unsigned long MAX_ON_MS = 1500;
 
 bool relayOn = false;
